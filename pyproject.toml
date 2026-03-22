@@ -15,4 +15,11 @@ dependencies = [
     "scikit-image",
     "tqdm",
     "accelerate",
+    "fastapi",
+    "uvicorn",
+    "python-multipart",
+    "gradio",
+    "onnx",
+    "onnxruntime",
+    "onnxconverter-common",
 ]
