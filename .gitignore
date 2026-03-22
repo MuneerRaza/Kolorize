@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environment
+.venv/
+
+# Data & weights
+*.pt
+*.pth
+*.onnx
+*.bin
+data/raw/
+data/processed/
+checkpoints/
+weights/
+samples/
+
+# MLOps
+wandb/
+mlruns/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.env.local
+
+# Node (frontend)
+node_modules/
+.next/
+out/
+
+# Misc
+*.log
