@@ -1,0 +1,11 @@
+torch>=2.2.0
+torchvision>=0.17.0
+numpy
+opencv-python
+Pillow
+datasets
+wandb
+lpips
+scikit-image
+tqdm
+accelerate
