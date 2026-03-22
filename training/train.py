@@ -223,8 +223,10 @@ def save_checkpoint(
 ):
     """Save training checkpoint."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    # Always save unwrapped model (works with or without DataParallel)
+    raw_model = model.module if isinstance(model, nn.DataParallel) else model
     torch.save({
-        "model": model.state_dict(),
+        "model": raw_model.state_dict(),
         "ema": ema.state_dict(),
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict() if scheduler else None,
@@ -263,8 +265,15 @@ def train(config: TrainConfig):
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {total_params:,} ({total_params / 1e6:.1f}M)")
 
-    # EMA
-    ema = EMA(model, decay=config.ema_decay)
+    # Multi-GPU support
+    num_gpus = torch.cuda.device_count()
+    if num_gpus > 1:
+        print(f"Using {num_gpus} GPUs with DataParallel")
+        model = nn.DataParallel(model)
+
+    # EMA (always on the unwrapped model)
+    raw_model = model.module if isinstance(model, nn.DataParallel) else model
+    ema = EMA(raw_model, decay=config.ema_decay)
 
     # Diffusion
     diffusion = GaussianDiffusion(
@@ -294,7 +303,8 @@ def train(config: TrainConfig):
     global_step = 0
     if config.resume and os.path.exists(config.resume):
         ckpt = torch.load(config.resume, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model"])
+        raw_model = model.module if isinstance(model, nn.DataParallel) else model
+        raw_model.load_state_dict(ckpt["model"])
         ema.load_state_dict(ckpt["ema"])
         optimizer.load_state_dict(ckpt["optimizer"])
         if ckpt.get("scheduler") and scheduler:
