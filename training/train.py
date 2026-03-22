@@ -327,14 +327,18 @@ def train(config: TrainConfig):
     if use_wandb:
         try:
             import wandb
-            wandb.init(
+            run = wandb.init(
                 project=config.wandb_project,
                 name=config.wandb_run_name or None,
                 config=vars(config),
+                resume="allow",
             )
-        except Exception:
+            if run is None:
+                raise RuntimeError("wandb.init returned None")
+            print(f"W&B run: {run.url}")
+        except Exception as e:
             use_wandb = False
-            print("W&B init failed, continuing without logging")
+            print(f"W&B init failed: {e}, continuing without logging")
 
     # ---------------------------------------------------------------
     # Training loop
@@ -357,16 +361,25 @@ def train(config: TrainConfig):
             optimizer.zero_grad()
 
             # Forward pass with optional mixed precision
+            # Perceptual loss every 10 steps to save VRAM
+            compute_perceptual = config.use_perceptual and (num_batches % 10 == 0)
+
             with torch.amp.autocast("cuda", enabled=scaler is not None):
                 result = diffusion.training_step(model, L, ab)
 
-                losses = criterion(
-                    noise_pred=result["noise_pred"],
-                    noise_target=result["noise_target"],
-                    x0_pred=result["x0_pred"],
-                    x0_target=result["x0_target"],
-                    L=L,
-                )
+                if compute_perceptual:
+                    losses = criterion(
+                        noise_pred=result["noise_pred"],
+                        noise_target=result["noise_target"],
+                        x0_pred=result["x0_pred"].detach(),
+                        x0_target=result["x0_target"],
+                        L=L,
+                    )
+                else:
+                    losses = criterion(
+                        noise_pred=result["noise_pred"],
+                        noise_target=result["noise_target"],
+                    )
                 loss = losses["total"]
 
             # Backward
