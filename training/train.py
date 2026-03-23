@@ -63,6 +63,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gradient-clip", type=float, default=1.0)
     parser.add_argument("--ema-decay", type=float, default=0.9999)
     parser.add_argument("--no-amp", action="store_true", help="Disable mixed precision")
+    parser.add_argument("--prediction-type", type=str, default="v", choices=["v", "epsilon"])
+    parser.add_argument("--snr-gamma", type=float, default=5.0, help="Min-SNR-γ. 0 to disable")
 
     # Loss
     parser.add_argument("--no-perceptual", action="store_true")
@@ -106,6 +108,8 @@ def build_config(args: argparse.Namespace) -> TrainConfig:
         gradient_clip=args.gradient_clip,
         ema_decay=args.ema_decay,
         use_amp=not args.no_amp,
+        prediction_type=args.prediction_type,
+        snr_gamma=args.snr_gamma,
         use_perceptual=not args.no_perceptual,
         perceptual_weight=args.perceptual_weight,
         wandb_project=args.wandb_project,
@@ -279,6 +283,8 @@ def train(config: TrainConfig):
     diffusion = GaussianDiffusion(
         timesteps=config.timesteps,
         schedule=config.beta_schedule,
+        prediction_type=config.prediction_type,
+        snr_gamma=config.snr_gamma,
     )
 
     # Loss
@@ -348,7 +354,7 @@ def train(config: TrainConfig):
     for epoch in range(start_epoch, config.epochs):
         model.train()
         epoch_loss = 0.0
-        epoch_noise_loss = 0.0
+        epoch_pred_loss = 0.0
         epoch_perc_loss = 0.0
         num_batches = 0
 
@@ -369,16 +375,18 @@ def train(config: TrainConfig):
 
                 if compute_perceptual:
                     losses = criterion(
-                        noise_pred=result["noise_pred"],
-                        noise_target=result["noise_target"],
+                        model_output=result["model_output"],
+                        target=result["target"],
+                        snr_weights=result["snr_weights"],
                         x0_pred=result["x0_pred"].detach(),
                         x0_target=result["x0_target"],
                         L=L,
                     )
                 else:
                     losses = criterion(
-                        noise_pred=result["noise_pred"],
-                        noise_target=result["noise_target"],
+                        model_output=result["model_output"],
+                        target=result["target"],
+                        snr_weights=result["snr_weights"],
                     )
                 loss = losses["total"]
 
@@ -399,14 +407,14 @@ def train(config: TrainConfig):
 
             # Track losses
             epoch_loss += loss.item()
-            epoch_noise_loss += losses["noise_loss"].item()
+            epoch_pred_loss += losses["prediction_loss"].item()
             epoch_perc_loss += losses["perceptual_loss"].item()
             num_batches += 1
             global_step += 1
 
             pbar.set_postfix({
                 "loss": f"{loss.item():.4f}",
-                "noise": f"{losses['noise_loss'].item():.4f}",
+                "pred": f"{losses['prediction_loss'].item():.4f}",
                 "perc": f"{losses['perceptual_loss'].item():.4f}",
             })
 
@@ -415,7 +423,7 @@ def train(config: TrainConfig):
                 import wandb
                 wandb.log({
                     "train/loss": loss.item(),
-                    "train/noise_loss": losses["noise_loss"].item(),
+                    "train/prediction_loss": losses["prediction_loss"].item(),
                     "train/perceptual_loss": losses["perceptual_loss"].item(),
                     "train/lr": optimizer.param_groups[0]["lr"],
                     "train/step": global_step,
@@ -424,10 +432,10 @@ def train(config: TrainConfig):
         # End of epoch
         scheduler.step()
         avg_loss = epoch_loss / max(num_batches, 1)
-        avg_noise = epoch_noise_loss / max(num_batches, 1)
+        avg_pred = epoch_pred_loss / max(num_batches, 1)
         avg_perc = epoch_perc_loss / max(num_batches, 1)
 
-        print(f"  Epoch {epoch + 1}: loss={avg_loss:.4f} noise={avg_noise:.4f} perc={avg_perc:.4f}")
+        print(f"  Epoch {epoch + 1}: loss={avg_loss:.4f} noise={avg_pred:.4f} perc={avg_perc:.4f}")
 
         # Generate samples
         if (epoch + 1) % config.sample_interval == 0:

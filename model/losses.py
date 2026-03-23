@@ -1,16 +1,13 @@
 """
 Loss functions for colorization diffusion training.
 
-Primary: L1 loss on noise prediction (standard DDPM objective)
+Primary: Weighted L1 loss on prediction (v or ε) with Min-SNR-γ weighting
 Auxiliary: VGG perceptual loss on reconstructed x0 (prevents desaturation)
-
-The perceptual loss is key for vivid colors — L1 alone tends to produce
-muted/brownish outputs because the "average" of all possible colors is gray.
-VGG features push toward realistic textures and color distributions.
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision.models as models
 
 
@@ -18,11 +15,7 @@ class VGGPerceptualLoss(nn.Module):
     """VGG-based perceptual loss.
 
     Extracts features from relu1_2, relu2_2, relu3_3 of pretrained VGG16
-    and computes L1 distance. These layers capture increasingly abstract
-    features: edges → textures → semantic patterns.
-
-    Note: VGG expects 3-channel RGB input. Since we predict AB (2 channels),
-    we combine with L channel to create a pseudo-RGB for VGG.
+    and computes L1 distance.
     """
 
     def __init__(self):
@@ -31,16 +24,13 @@ class VGGPerceptualLoss(nn.Module):
         vgg = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1)
         features = vgg.features
 
-        # Extract at these layers (relu after each conv block)
         self.slice1 = nn.Sequential(*features[:4])   # relu1_2
         self.slice2 = nn.Sequential(*features[4:9])   # relu2_2
         self.slice3 = nn.Sequential(*features[9:16])  # relu3_3
 
-        # Freeze — we never train VGG
         for param in self.parameters():
             param.requires_grad = False
 
-        # ImageNet normalization
         self.register_buffer(
             "mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
         )
@@ -49,42 +39,27 @@ class VGGPerceptualLoss(nn.Module):
         )
 
     def _normalize(self, x: torch.Tensor) -> torch.Tensor:
-        """Normalize from [-1, 1] to ImageNet range."""
-        x = (x + 1) / 2  # [-1, 1] → [0, 1]
+        x = (x + 1) / 2
         return (x - self.mean) / self.std
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """Compute perceptual loss between predicted and target.
-
-        Args:
-            pred: Predicted image (B, 3, H, W), range [-1, 1]
-            target: Target image (B, 3, H, W), range [-1, 1]
-
-        Returns:
-            Scalar perceptual loss.
-        """
         pred = self._normalize(pred)
         target = self._normalize(target)
 
         loss = torch.tensor(0.0, device=pred.device)
-
-        # Extract and compare features at each level
         p, t = pred, target
         for layer in [self.slice1, self.slice2, self.slice3]:
             p = layer(p)
             t = layer(t)
-            loss = loss + nn.functional.l1_loss(p, t)
+            loss = loss + F.l1_loss(p, t)
 
         return loss
 
 
 class ColorizationLoss(nn.Module):
-    """Combined loss for colorization diffusion training.
+    """Combined loss with Min-SNR-γ weighting.
 
-    L_total = L1(noise_pred, noise_target) + λ × VGG_perceptual(x0_pred, x0_target)
-
-    The perceptual loss is computed on the reconstructed x0 (not the noise),
-    converted to pseudo-RGB by concatenating with the L channel.
+    L_total = SNR_weight × L1(pred, target) + λ × VGG_perceptual(x0_pred, x0_target)
 
     Args:
         perceptual_weight: Weight for VGG perceptual loss (λ).
@@ -93,7 +68,6 @@ class ColorizationLoss(nn.Module):
 
     def __init__(self, perceptual_weight: float = 0.1, use_perceptual: bool = True):
         super().__init__()
-        self.l1 = nn.L1Loss()
         self.perceptual_weight = perceptual_weight
         self.use_perceptual = use_perceptual
 
@@ -102,8 +76,9 @@ class ColorizationLoss(nn.Module):
 
     def forward(
         self,
-        noise_pred: torch.Tensor,
-        noise_target: torch.Tensor,
+        model_output: torch.Tensor,
+        target: torch.Tensor,
+        snr_weights: torch.Tensor | None = None,
         x0_pred: torch.Tensor | None = None,
         x0_target: torch.Tensor | None = None,
         L: torch.Tensor | None = None,
@@ -111,38 +86,40 @@ class ColorizationLoss(nn.Module):
         """Compute combined loss.
 
         Args:
-            noise_pred: Predicted noise (B, 2, H, W)
-            noise_target: Actual noise (B, 2, H, W)
-            x0_pred: Reconstructed AB from predicted noise (B, 2, H, W)
+            model_output: Model prediction — v or ε (B, 2, H, W)
+            target: Target — v or ε (B, 2, H, W)
+            snr_weights: Min-SNR-γ weights per sample (B,)
+            x0_pred: Reconstructed AB (B, 2, H, W)
             x0_target: Ground truth AB (B, 2, H, W)
-            L: L channel (B, 1, H, W) — needed to create pseudo-RGB for VGG
-
-        Returns:
-            Dict with 'total', 'noise_loss', 'perceptual_loss'
+            L: L channel (B, 1, H, W)
         """
-        # Primary: L1 on noise prediction
-        noise_loss = self.l1(noise_pred, noise_target)
+        # Per-sample L1 loss
+        prediction_loss = F.l1_loss(model_output, target, reduction="none")
+        prediction_loss = prediction_loss.mean(dim=[1, 2, 3])  # (B,)
 
-        result = {"noise_loss": noise_loss}
+        # Apply Min-SNR weights
+        if snr_weights is not None:
+            prediction_loss = prediction_loss * snr_weights
 
-        # Auxiliary: perceptual loss on reconstructed x0
+        prediction_loss = prediction_loss.mean()
+
+        result = {"prediction_loss": prediction_loss}
+
+        # Perceptual loss on reconstructed x0
         if (
             self.use_perceptual
             and x0_pred is not None
             and x0_target is not None
             and L is not None
         ):
-            # Create pseudo-RGB: concat L + AB → 3 channels
-            # This isn't true RGB, but VGG features still capture
-            # texture/structure similarity effectively
-            pred_rgb = torch.cat([L, x0_pred], dim=1)    # (B, 3, H, W)
-            target_rgb = torch.cat([L, x0_target], dim=1)  # (B, 3, H, W)
+            pred_rgb = torch.cat([L, x0_pred], dim=1)
+            target_rgb = torch.cat([L, x0_target], dim=1)
 
             perceptual_loss = self.vgg(pred_rgb, target_rgb)
             result["perceptual_loss"] = perceptual_loss
-            result["total"] = noise_loss + self.perceptual_weight * perceptual_loss
+            result["total"] = prediction_loss + self.perceptual_weight * perceptual_loss
         else:
-            result["perceptual_loss"] = torch.tensor(0.0, device=noise_loss.device)
-            result["total"] = noise_loss
+            result["perceptual_loss"] = torch.tensor(0.0, device=prediction_loss.device)
+            result["total"] = prediction_loss
 
         return result

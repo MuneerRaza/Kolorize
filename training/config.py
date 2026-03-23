@@ -21,8 +21,10 @@ class TrainConfig:
     dropout: float = 0.0
 
     # Diffusion
-    timesteps: int = 1000
+    timesteps: int = 250                # 250 is enough (was 1000)
     beta_schedule: str = "linear"       # "linear" or "cosine"
+    prediction_type: str = "v"          # "v" (faster convergence) or "epsilon" (legacy)
+    snr_gamma: float = 5.0              # Min-SNR-γ weighting. 0 to disable.
 
     # Training
     batch_size: int = 8
