@@ -181,3 +181,53 @@ class InferenceEngine:
             "method": method,
             "steps": num_steps,
         }
+
+    @torch.no_grad()
+    def colorize_streaming(
+        self,
+        image: np.ndarray,
+        num_steps: int = 20,
+    ):
+        """Colorize with intermediate results at each step.
+
+        Yields (step, total_steps, intermediate_rgb) at each denoising step.
+        """
+        L_tensor, original_size = self._preprocess(image)
+        shape = (1, 2, self.image_size, self.image_size)
+        device = L_tensor.device
+        b = shape[0]
+
+        diffusion = self.diffusion
+        timestep_sequence = diffusion._uniform_sequence(num_steps)
+
+        x_t = torch.randn(shape, device=device)
+
+        for i in range(len(timestep_sequence) - 1):
+            t_curr = timestep_sequence[i]
+            t_prev = timestep_sequence[i + 1]
+
+            t_batch = torch.full((b,), t_curr, device=device, dtype=torch.long)
+
+            model_input = torch.cat([L_tensor, x_t], dim=1)
+            model_output = self.model(model_input, t_batch)
+
+            if diffusion.prediction_type == "v":
+                predicted_noise = diffusion.predict_noise_from_v(x_t, t_batch, model_output)
+            else:
+                predicted_noise = model_output
+
+            alpha_curr = diffusion.alphas_cumprod[t_curr].to(device)
+            alpha_prev = (
+                diffusion.alphas_cumprod[t_prev].to(device) if t_prev >= 0
+                else torch.tensor(1.0, device=device)
+            )
+
+            x0_pred = (x_t - torch.sqrt(1 - alpha_curr) * predicted_noise) / torch.sqrt(alpha_curr)
+            x0_pred = torch.clamp(x0_pred, -1.0, 1.0)
+
+            dir_xt = torch.sqrt(1 - alpha_prev) * predicted_noise
+            x_t = torch.sqrt(alpha_prev) * x0_pred + dir_xt
+
+            # Yield intermediate image
+            intermediate_rgb = self._postprocess(L_tensor, x0_pred, original_size)
+            yield (i + 1, num_steps, intermediate_rgb)

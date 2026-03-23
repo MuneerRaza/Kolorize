@@ -101,6 +101,36 @@ def create_app(checkpoint_path: str, device: str | None = None):
             "steps": result["steps"],
         }
 
+    @app.post("/api/colorize-stream")
+    async def colorize_stream(
+        file: UploadFile = File(...),
+        steps: int = 20,
+    ):
+        """Colorize with streaming intermediate results via SSE."""
+        from starlette.responses import StreamingResponse
+        import json as json_mod
+
+        contents = await file.read()
+        nparr = np.frombuffer(contents, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if img is None:
+            return JSONResponse(status_code=400, content={"error": "Invalid image"})
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+        steps = max(5, min(50, steps))
+
+        def generate():
+            for step, total, intermediate in engine.colorize_streaming(img, num_steps=steps):
+                data = {
+                    "step": step,
+                    "total": total,
+                    "image": numpy_to_base64(intermediate),
+                }
+                yield f"data: {json_mod.dumps(data)}\n\n"
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(generate(), media_type="text/event-stream")
+
     return app
 
 
